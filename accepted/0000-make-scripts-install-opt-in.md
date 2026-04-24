@@ -227,11 +227,62 @@ In a workspace (monorepo) context:
 
 If a package in `optionalDependencies` has install scripts that are blocked, it is treated as a failed optional dependency installation. This is consistent with existing behavior where optional dependencies that fail to build are silently skipped.
 
-### Detecting unexpected script changes
+### Detecting unexpected script changes (TOFU)
 
-When a `package-lock.json` is present, npm already records the full metadata for each resolved package. The implementation should additionally track which packages had install scripts at lock time. If a subsequent `npm install` resolves a package version whose scripts differ from what was recorded in the lock file (e.g., a previously script-free package now has a `postinstall`), npm should treat this as an unreviewed package and block the script with a warning, even if a name-only `allowScripts` entry exists for that package.
+#### What the lockfile already records
 
-This provides a [Trust On First Use (TOFU)](https://en.wikipedia.org/wiki/Trust_on_first_use) model: the first install establishes a baseline, and changes to script presence trigger review. This directly addresses the attack pattern where a compromised maintainer adds a `postinstall` script to a patch release of a previously script-free package.
+npm's `package-lock.json` (lockfile version 3) already stores a boolean `hasInstallScript` field on each package entry. This flag is `true` when a package defines `preinstall`, `install`, or `postinstall` in its `scripts` field, or ships a `binding.gyp`. The flag is set by `@npmcli/arborist` during lockfile generation (see `shrinkwrap.js`, `pkgMetaKeys` and `nodeMetaKeys`). Today this field is purely informational. It is used as a performance hint during rebuild to decide whether to parse a package's `package.json`, but no code compares the stored value against fetched package metadata for security purposes.
+
+Crucially, the lockfile records only the *presence* of install scripts, not their *contents*. Actual script bodies (e.g., `"postinstall": "node -e \"require('./malicious')\"`) are not persisted. This is the right granularity for the TOFU mechanism described below. Content hashing is explored and rejected in the design options.
+
+#### How other tools handle this
+
+pnpm does not record script presence in `pnpm-lock.yaml`. Its `allowBuilds` map is a static name-or-name@version allowlist evaluated at install time; there is no TOFU or script-change detection. If a package is allowed by name, a new version that adds scripts will run without warning.
+
+Bun stores actual script command strings in its lockfile (`bun.lock`), and has a `has_install_script` field in its binary lockfile format (`bun.lockb`). However, Bun performs no comparison between lockfile state and fetched package state. Once a package is in `trustedDependencies`, all its scripts run unconditionally, including scripts added in later versions. Bun also maintains a hardcoded default-trust list of ~500 packages, which means a compromise of any default-trusted package affects all Bun users with no TOFU gate.
+
+@lavamoat/allow-scripts has the strongest TOFU model among existing tools. It stores decisions in `package.json` under `lavamoat.allowScripts` with version-pinned keys (`"sharp#0.33.2": true`). When a version changes, the old key no longer matches and the package is treated as unconfigured — the install fails and forces the user to re-run `allow-scripts auto`. This version-pinning approach means every version bump requires explicit re-approval, which is secure but creates friction during routine updates.
+
+#### The persistence problem
+
+Consider a name-only `allowScripts` entry (`"sharp": true`) and a version bump from 0.33.2 (no scripts) to 0.34.0 (adds `postinstall`):
+
+1. First `npm install` resolving 0.34.0: The lockfile records `hasInstallScript: false` for sharp (from the previous resolution). The fetched 0.34.0 package has `postinstall`. The TOFU check fires and the script is blocked with a warning.
+2. The user runs `npm approve-scripts sharp`. The lockfile is regenerated with `hasInstallScript: true` for sharp@0.34.0.
+3. Next `npm install` or `npm ci`: The lockfile now says `hasInstallScript: true`, the fetched package has `postinstall`, the name-only allowScripts entry permits it. The script runs. The TOFU protection was one-shot.
+
+This is the intended behavior, not a bug, but it requires careful design to ensure the one-shot protection is meaningful and the approval step is explicit.
+
+#### Design: lockfile-based TOFU with explicit approval
+
+The TOFU mechanism works as follows:
+
+The existing `hasInstallScript` boolean field in `package-lock.json` is sufficient. No new lockfile fields are needed. The field already captures whether a package had install scripts at the time the lockfile was last written.
+
+Arborist's reify pipeline runs scripts *before* writing the new lockfile. The sequence is: resolve tree → extract tarballs → run lifecycle scripts → write lockfile. This means the old lockfile (accessible via `actualTree.meta`) is still intact when scripts are about to execute. The TOFU check compares the old lockfile's `hasInstallScript` value for each package against the fetched package's actual scripts. The check can be inserted in `rebuild.js`'s `#runScripts()` method, which is the single chokepoint for all lifecycle script execution. A script is blocked (even if the package has a name-only `allowScripts` entry) when:
+
+- The lockfile records `hasInstallScript: false` (or the field is absent) and the fetched package has install scripts. This is the "new script introduced" case.
+- The package entry does not exist in the lockfile at all (new dependency). This is already handled by the normal `allowScripts` check.
+
+A change in script *contents* for a package that already had scripts (lockfile says `hasInstallScript: true`, fetched package also has scripts but different ones) does not trigger a TOFU block. Content-level change detection would require storing script hashes in the lockfile, adding complexity with marginal security benefit — an attacker who controls a package that already has install scripts can change the script body within the existing script entry, but this attack vector is equivalent to changing any other code in the package and is better addressed by integrity checking and provenance attestations.
+
+To resolve a TOFU block, the user runs `npm approve-scripts`, which shows the newly detected scripts and prompts for approval. On approval, it runs `npm rebuild` for the approved packages and regenerates the lockfile with `hasInstallScript: true` for those packages. The lockfile update is the persistence mechanism — subsequent installs see the updated baseline.
+
+The `--dangerously-allow-all-scripts` flag bypasses all script policy enforcement, including TOFU blocks. It should not update the lockfile's `hasInstallScript` baseline, so using the escape hatch does not silently approve scripts for future normal installs.
+
+The one-shot model is sufficient because the TOFU block fires at the moment it matters: when a dependency's install scripts change during a version update. After explicit approval, the lockfile baseline reflects the approved state, and the name-only `allowScripts` entry correctly permits the script on subsequent installs. The next TOFU event fires if scripts change again (e.g., another version adds a different script, or a package removes and re-adds scripts).
+
+For teams that want stronger guarantees, version-pinned `allowScripts` entries (`"sharp@0.33.2": true`) are available. A version-pinned entry means any version change requires re-approval through the normal `allowScripts` mechanism (not TOFU), because the new version simply won't match the allowlist entry. `npm approve-scripts` should default to generating version-pinned entries, with a `--pin=false` flag for teams that prefer name-only entries:
+
+```json
+{
+  "allowScripts": {
+    "sharp@0.34.0": true
+  }
+}
+```
+
+Users who want name-only entries (accepting the weaker-but-still-useful TOFU-only protection) can use `npm approve-scripts --pin=false` or manually edit the entry.
 
 ## Rationale and Alternatives
 
@@ -271,7 +322,7 @@ Bun uses a `trustedDependencies` array of package names. pnpm's `allowBuilds` us
 
 The primary enforcement point is in the `@npmcli/run-script` and `@npmcli/arborist` packages:
 
-1. `@npmcli/arborist`: During the `reify` step, before running lifecycle scripts for each dependency, check the resolved package name and version against the root project's `allowScripts` field. If the package is not allowed, skip its scripts and record it in a "blocked scripts" list.
+1. `@npmcli/arborist`: During the `reify` step, before running lifecycle scripts for each dependency, check the resolved package name and version against the root project's `allowScripts` field. If the package is not allowed, skip its scripts and record it in a "blocked scripts" list. The TOFU check also lives here: in `rebuild.js`'s `#runScripts()`, compare each node's `hasInstallScript` against the old lockfile's value (available via `actualTree.meta.get(path)` since scripts run before `_saveIdealTree()` writes the new lockfile). If the old value is `false` and the fetched package has scripts, block the script even if a name-only `allowScripts` entry exists.
 
 2. `@npmcli/run-script`: Add an `allowed` check that consults the policy stack (CLI flags -> `package.json` -> `.npmrc`). When a script is blocked, emit a warning (or error in strict mode) with the package name, script name, and remediation command.
 
@@ -341,7 +392,7 @@ New `.npmrc` settings:
 
 3. Provenance integration: should packages published with [npm provenance](https://docs.npmjs.com/generating-provenance-statements) attestations receive any preferential treatment in the script policy? For example, a future `trust-policy` setting could allow scripts only from packages with verified provenance. This is deferred to a follow-up RFC.
 
-4. Version pinning default: this RFC allows both name-only (`"sharp": true`) and version-pinned (`"sharp@0.33.2": true`) entries. Should the default output of `npm approve-scripts` pin to the currently installed version, or use name-only? Name-only is more convenient; version-pinned is more secure.
+4. ~~Version pinning default~~: Resolved. `npm approve-scripts` should default to version-pinned entries for security (see "Detecting unexpected script changes" section). A `--pin=false` flag allows name-only entries for convenience.
 
 5. Remaining native addon packages: the ecosystem has largely shifted to prebuilt binaries, but some packages still require `node-gyp` at install time. Updated data on how many of the top-downloaded packages still use install scripts would strengthen the migration plan. If the number is small enough, the default-deny change is justified without a new npm-side mechanism for native addon distribution.
 
