@@ -127,7 +127,9 @@ Package entries may include version constraints using the `@` separator:
 }
 ```
 
-A name-only entry (e.g., `"sharp": true`) allows all versions. A versioned entry (e.g., `"nx@21.6.4 || 21.6.5": true`) restricts the allowance to specific versions. If both a name-only entry and a versioned entry exist for the same package, the versioned entry takes precedence for matching versions.
+A name-only entry (e.g., `"sharp": true`) allows all versions. A versioned entry (e.g., `"nx@21.6.4 || 21.6.5": true`) restricts the allowance to specific versions, using exact versions joined by `||`. Semver ranges like `^`, `~`, `>=`, or `<` are not supported. This is intentional: a range like `nx@<21.6.4` would automatically trust future versions that haven't been reviewed, which defeats the purpose of an allowlist. If both a name-only entry and a versioned entry exist for the same package, the versioned entry takes precedence for matching versions.
+
+This matches pnpm's `allowBuilds` design, which also restricts versioned entries to exact versions with `||` disjunction.
 
 The `allowScripts` field is only read from the root project's `package.json` (or workspace root). `allowScripts` fields in dependency `package.json` files are ignored. This is a consumer-side policy, not a publisher declaration.
 
