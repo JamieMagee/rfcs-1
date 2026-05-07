@@ -2,7 +2,7 @@
 
 ## Summary
 
-Dependency install scripts (`preinstall`, `install`, `postinstall`, and auto-detected `node-gyp` builds) should be blocked by default during `npm install`. Projects opt in to running scripts for specific dependencies by listing them in a new `allowScripts` field in `package.json`. An interactive `npm approve-scripts` command helps users build and maintain this allowlist.
+Dependency install scripts (`preinstall`, `install`, `postinstall`, and auto-detected `node-gyp` builds) should be blocked by default during `npm install`. Projects opt in to running scripts for specific dependencies by listing them in a new `allowScripts` field in `package.json`. An `npm approve-scripts` command helps users build and maintain this allowlist.
 
 This proposal aligns npm with pnpm (v10+), Yarn Berry, and Bun, all of which already block dependency install scripts by default.
 
@@ -86,7 +86,7 @@ The following are out of scope:
 The design is modeled on pnpm v10's `allowBuilds` system, adapted for npm conventions:
 
 1. A new `allowScripts` field in `package.json` declares which dependencies are permitted to run install scripts.
-2. A new `npm approve-scripts` command provides an interactive workflow for managing the allowlist.
+2. A new `npm approve-scripts` command writes allowlist decisions to `package.json` from the command line.
 3. Dependency install scripts not covered by the allowlist are blocked, with a clear warning and remediation instructions.
 4. A phased rollout allows the ecosystem to migrate gradually.
 
@@ -131,18 +131,81 @@ A name-only entry (e.g., `"sharp": true`) allows all versions. A versioned entry
 
 This matches pnpm's `allowBuilds` design, which also restricts versioned entries to exact versions with `||` disjunction.
 
+Non-registry dependencies (git, file, tarball) use [`package-spec`](https://docs.npmjs.com/cli/v11/using-npm/package-spec) syntax. See [Identity matching](#identity-matching) below for the supported key forms.
+
 The `allowScripts` field is only read from the root project's `package.json` (or workspace root). `allowScripts` fields in dependency `package.json` files are ignored. This is a consumer-side policy, not a publisher declaration.
+
+### Identity matching
+
+Package names in npm are not a trustworthy identity for security policy. Each `allowScripts` key is matched against a node's resolved identity from the lockfile, not against the package's self-reported name.
+
+Two ecosystem flaws make name-based matching unsafe:
+
+1. The npm alias mechanism. `npm install trusted@npm:naughty` installs `naughty` under the folder `node_modules/trusted`. In the resulting tree, `node.name` is `"trusted"` (the alias / folder name) and `node.package.name` is `"naughty"` (the tarball's self-report). An allowlist that matched on either field would let an attacker bind a malicious package to a trusted name by getting it installed via an alias.
+
+2. Manifest confusion. The npm registry does not validate that a published tarball's internal `package.json` matches the manifest the registry serves. (Disclosed [March 2023](https://blog.vlt.sh/blog/the-massive-hole-in-the-npm-ecosystem); unfixed as of 2026.) A package published as `naughty` can ship a tarball whose `package.json` declares `name: "trusted"`. After install, `node.package.name` is `"trusted"` regardless of where the tarball came from.
+
+Both problems apply to any allowlist that matches by package name, including a map-based one. The fix is to match against the lockfile's `resolved` field, which is set by the resolver, not by the tarball.
+
+#### What the key matches against
+
+Keys are parsed with [`npm-package-arg`](https://github.com/npm/npm-package-arg), the same parser that handles `npm install <spec>` and `package.json` dependency entries. The parsed spec is matched against each node's resolved identity, recorded in `package-lock.json`:
+
+| Dependency type         | Resolved identity                                                                                                                                     |
+|-------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Registry (version)      | `name@version` (e.g. `sharp@0.34.0`)                                                                                                                  |
+| Registry (range)        | `name` matches any resolved version; `name@version` matches exactly                                                                                   |
+| Alias                   | The underlying registered package, not the alias. `npm install trusted@npm:naughty@1.0.0` matches against `naughty@1.0.0`, never `trusted`.           |
+| Git                     | The resolved git ref (e.g. `npm/cli#c12ea07`). A name-only entry like `"npm/cli"` permits any resolved commit of that repository.                     |
+| File / tarball / folder | The resolved URL or path (e.g. `https://example.com/foo.tgz`, `file:./vendor/foo`).                                                                   |
+
+Examples:
+
+```json
+{
+  "allowScripts": {
+    "sharp": true,
+    "sharp@0.34.0": true,
+    "sharp@0.33.2 || 0.33.3 || 0.34.0": true,
+    "npm/cli": true,
+    "npm/cli#c12ea07": true,
+    "@myorg/internal-tool": true
+  }
+}
+```
+
+A name-only entry permits any resolved version or commit: `"npm/cli": true` matches any commit of that repository just as `"npm": true` matches any version of the package. A fully-qualified entry (`"npm/cli#c12ea07"`, `"sharp@0.34.0"`) pins exactly one.
+
+#### Fields the key MUST NOT match against
+
+Implementations MUST NOT match keys against:
+
+- `node.name` (the install location / folder name)
+- `node.package.name` (the tarball's self-reported `package.json#name`)
+- `node.package.version` (the tarball's self-reported `package.json#version`)
+- `node.package.repository` (self-reported and unverified)
+
+All four are attacker-controllable through manifest confusion or alias installs. The lockfile's `resolved` field, set by the resolver from the registry response or the user's git/tarball/file spec, is the only field set independently of the tarball.
+
+#### Forward compatibility with a query selector grammar
+
+The key syntax above is forward-compatible with npm's existing [dependency selectors](https://docs.npmjs.com/cli/v11/using-npm/dependency-selectors) (`npm query`). Today, only package-specs are accepted as keys. If a future arborist version exposes a trustworthy queryable identity (see Unresolved Questions), the same key position could accept full selector syntax (`":root > .prod"`, `":type(git)"`, etc.) alongside today's bare-name and `name@spec` keys. The bare-name keys would then read as sugar over a name-equality selector against the identity field.
+
+The full selector grammar is intentionally out of scope. Today's `#name` and `[name=...]` selectors match against `node.name` and `node.package.name`, which the identity rule above excludes. Shipping a selector-based allowlist before arborist has a trustworthy queryable identity would inherit the same exposure; extending the query engine to add one is a design effort of its own. [RFC #861](https://github.com/npm/rfcs/pull/861) reached the same conclusion ("the query language has no trustworthy package identity").
 
 ### Policy layering
 
-Script permissions are resolved from multiple sources with the following precedence (highest to lowest):
+Script permissions are resolved from a single layer in the precedence chain below (highest to lowest). Layers are **not** merged:
 
 1. CLI flags (`--allow-scripts`, `--no-scripts`, `--dangerously-allow-all-scripts`)
 2. Project `package.json` (`allowScripts` field)
-3. User `.npmrc` (`allow-scripts` setting)
-4. Global `.npmrc` (`allow-scripts` setting)
+3. Project `.npmrc` (`allow-scripts` setting)
+4. User `.npmrc`
+5. Global `.npmrc`
 
-The `.npmrc` setting provides a fallback for contexts without a project `package.json`, such as `npm install -g` and `npx`:
+The first layer that defines any allowlist configuration wins for the entire install; lower-precedence layers are not consulted at all. This avoids surprising merge semantics where, for example, a project `package.json` entry for one version is silently augmented by a `.npmrc` entry for another. If a project sets `"allowScripts": { "sharp@0.34.0": true }` in `package.json` and the installed version resolves to `0.35.0`, the install fails the way any other unmatched-version case fails — regardless of what `.npmrc` says.
+
+The `.npmrc` setting is intended for contexts without a project `package.json` `allowScripts` field at all, such as `npm install -g` and `npx`:
 
 ```ini
 ; ~/.npmrc
@@ -151,22 +214,7 @@ allow-scripts = canvas, sharp, sqlite3
 
 ### The `npm approve-scripts` command
 
-A new interactive command scans the dependency tree, identifies packages with install scripts, and prompts the user to approve or deny each one:
-
-```
-$ npm approve-scripts
-The following packages want to run install scripts:
-
-? Select packages to approve (Press <space> to select, <a> to toggle all)
-❯ ○ canvas (postinstall: node-gyp rebuild)
-  ○ sharp (install: node install/libvips && ...)
-  ○ sqlite3 (install: node-pre-gyp install ...)
-  ○ core-js (postinstall: node -e "try{require('./postins...")
-```
-
-After selection, approved packages are written to `allowScripts` with `true` and denied packages with `false`. Newly approved packages are immediately rebuilt.
-
-Non-interactive usage:
+A new command writes allowlist decisions to the `allowScripts` field in `package.json`:
 
 ```sh
 # Approve specific packages
@@ -175,17 +223,27 @@ npm approve-scripts canvas sharp
 # Deny specific packages
 npm approve-scripts !core-js
 
-# Approve all pending
+# Approve all packages with pending scripts
 npm approve-scripts --all
 ```
 
-### The `npm ignored-scripts` command
+Approved packages are written with `true`, denied packages with `false`, and newly approved packages are immediately rebuilt.
 
-Lists all dependencies whose install scripts were blocked during the last install:
+When an entry for a package already exists in `allowScripts` and the installed version differs, the command rewrites the entry rather than appending a `||` clause:
+
+| Existing entry      | Installed version | `--pin=true` (default)             | `--pin=false`         |
+|---------------------|-------------------|------------------------------------|-----------------------|
+| `pkg@a.b.c: true`   | `pkg@x.y.z`       | rewrite to `pkg@x.y.z: true`       | rewrite to `pkg: true`|
+| `pkg: true`         | `pkg@x.y.z`       | upgrade to `pkg@x.y.z: true`       | leave as `pkg: true`  |
+| (no entry)          | `pkg@x.y.z`       | write `pkg@x.y.z: true`            | write `pkg: true`     |
+
+The map stays focused on what is currently installed. Users who explicitly want a multi-version allowance (`pkg@a.b.c || x.y.z: true`) can edit the entry by hand.
+
+List packages with install scripts that are not yet in `allowScripts`, without writing any changes:
 
 ```
-$ npm ignored-scripts
-The following packages had their install scripts blocked:
+$ npm approve-scripts --pending
+The following packages have install scripts that are not approved:
 
   canvas (postinstall: node-gyp rebuild)
   sharp (install: node install/libvips && ...)
@@ -221,68 +279,12 @@ In a workspace (monorepo) context:
 
 - The root `package.json` `allowScripts` field is the single source of truth for the entire workspace.
 - Individual workspace `package.json` files do not have their own `allowScripts` fields. All script permissions are managed at the root.
+- If `allowScripts` appears in a non-root workspace `package.json`, npm prints a warning and ignores the field. Silently dropping it would be confusing for developers who placed it there expecting it to do something.
 - This avoids ambiguity about merge semantics and ensures security policy is set in one place.
 
 ### Optional dependencies
 
 If a package in `optionalDependencies` has install scripts that are blocked, it is treated as a failed optional dependency installation. This is consistent with existing behavior where optional dependencies that fail to build are silently skipped.
-
-### Detecting unexpected script changes (TOFU)
-
-#### What the lockfile already records
-
-npm's `package-lock.json` (lockfile version 3) already stores a boolean `hasInstallScript` field on each package entry. This flag is `true` when a package defines `preinstall`, `install`, or `postinstall` in its `scripts` field, or ships a `binding.gyp`. The flag is set by `@npmcli/arborist` during lockfile generation (see `shrinkwrap.js`, `pkgMetaKeys` and `nodeMetaKeys`). Today this field is purely informational. It is used as a performance hint during rebuild to decide whether to parse a package's `package.json`, but no code compares the stored value against fetched package metadata for security purposes.
-
-Crucially, the lockfile records only the *presence* of install scripts, not their *contents*. Actual script bodies (e.g., `"postinstall": "node -e \"require('./malicious')\"`) are not persisted. This is the right granularity for the TOFU mechanism described below. Content hashing is explored and rejected in the design options.
-
-#### How other tools handle this
-
-pnpm does not record script presence in `pnpm-lock.yaml`. Its `allowBuilds` map is a static name-or-name@version allowlist evaluated at install time; there is no TOFU or script-change detection. If a package is allowed by name, a new version that adds scripts will run without warning.
-
-Bun stores actual script command strings in its lockfile (`bun.lock`), and has a `has_install_script` field in its binary lockfile format (`bun.lockb`). However, Bun performs no comparison between lockfile state and fetched package state. Once a package is in `trustedDependencies`, all its scripts run unconditionally, including scripts added in later versions. Bun also maintains a hardcoded default-trust list of ~500 packages, which means a compromise of any default-trusted package affects all Bun users with no TOFU gate.
-
-@lavamoat/allow-scripts has the strongest TOFU model among existing tools. It stores decisions in `package.json` under `lavamoat.allowScripts` with version-pinned keys (`"sharp#0.33.2": true`). When a version changes, the old key no longer matches and the package is treated as unconfigured — the install fails and forces the user to re-run `allow-scripts auto`. This version-pinning approach means every version bump requires explicit re-approval, which is secure but creates friction during routine updates.
-
-#### The persistence problem
-
-Consider a name-only `allowScripts` entry (`"sharp": true`) and a version bump from 0.33.2 (no scripts) to 0.34.0 (adds `postinstall`):
-
-1. First `npm install` resolving 0.34.0: The lockfile records `hasInstallScript: false` for sharp (from the previous resolution). The fetched 0.34.0 package has `postinstall`. The TOFU check fires and the script is blocked with a warning.
-2. The user runs `npm approve-scripts sharp`. The lockfile is regenerated with `hasInstallScript: true` for sharp@0.34.0.
-3. Next `npm install` or `npm ci`: The lockfile now says `hasInstallScript: true`, the fetched package has `postinstall`, the name-only allowScripts entry permits it. The script runs. The TOFU protection was one-shot.
-
-This is the intended behavior, not a bug, but it requires careful design to ensure the one-shot protection is meaningful and the approval step is explicit.
-
-#### Design: lockfile-based TOFU with explicit approval
-
-The TOFU mechanism works as follows:
-
-The existing `hasInstallScript` boolean field in `package-lock.json` is sufficient. No new lockfile fields are needed. The field already captures whether a package had install scripts at the time the lockfile was last written.
-
-Arborist's reify pipeline runs scripts *before* writing the new lockfile. The sequence is: resolve tree → extract tarballs → run lifecycle scripts → write lockfile. This means the old lockfile (accessible via `actualTree.meta`) is still intact when scripts are about to execute. The TOFU check compares the old lockfile's `hasInstallScript` value for each package against the fetched package's actual scripts. The check can be inserted in `rebuild.js`'s `#runScripts()` method, which is the single chokepoint for all lifecycle script execution. A script is blocked (even if the package has a name-only `allowScripts` entry) when:
-
-- The lockfile records `hasInstallScript: false` (or the field is absent) and the fetched package has install scripts. This is the "new script introduced" case.
-- The package entry does not exist in the lockfile at all (new dependency). This is already handled by the normal `allowScripts` check.
-
-A change in script *contents* for a package that already had scripts (lockfile says `hasInstallScript: true`, fetched package also has scripts but different ones) does not trigger a TOFU block. Content-level change detection would require storing script hashes in the lockfile, adding complexity with marginal security benefit — an attacker who controls a package that already has install scripts can change the script body within the existing script entry, but this attack vector is equivalent to changing any other code in the package and is better addressed by integrity checking and provenance attestations.
-
-To resolve a TOFU block, the user runs `npm approve-scripts`, which shows the newly detected scripts and prompts for approval. On approval, it runs `npm rebuild` for the approved packages and regenerates the lockfile with `hasInstallScript: true` for those packages. The lockfile update is the persistence mechanism — subsequent installs see the updated baseline.
-
-The `--dangerously-allow-all-scripts` flag bypasses all script policy enforcement, including TOFU blocks. It should not update the lockfile's `hasInstallScript` baseline, so using the escape hatch does not silently approve scripts for future normal installs.
-
-The one-shot model is sufficient because the TOFU block fires at the moment it matters: when a dependency's install scripts change during a version update. After explicit approval, the lockfile baseline reflects the approved state, and the name-only `allowScripts` entry correctly permits the script on subsequent installs. The next TOFU event fires if scripts change again (e.g., another version adds a different script, or a package removes and re-adds scripts).
-
-For teams that want stronger guarantees, version-pinned `allowScripts` entries (`"sharp@0.33.2": true`) are available. A version-pinned entry means any version change requires re-approval through the normal `allowScripts` mechanism (not TOFU), because the new version simply won't match the allowlist entry. `npm approve-scripts` should default to generating version-pinned entries, with a `--pin=false` flag for teams that prefer name-only entries:
-
-```json
-{
-  "allowScripts": {
-    "sharp@0.34.0": true
-  }
-}
-```
-
-Users who want name-only entries (accepting the weaker-but-still-useful TOFU-only protection) can use `npm approve-scripts --pin=false` or manually edit the entry.
 
 ## Rationale and Alternatives
 
@@ -316,22 +318,30 @@ Bun uses a `trustedDependencies` array of package names. pnpm's `allowBuilds` us
 - It accommodates version pinning as a key in the map entry.
 - It is extensible to future per-package configuration if needed.
 
+### Why not lockfile-based change detection?
+
+An earlier draft proposed a lockfile-based check that would compare `package-lock.json`'s existing `hasInstallScript` boolean against fetched packages, blocking the script when a package previously without scripts gained them — even if the package had a name-only `allowScripts` entry. That mechanism was removed for two reasons.
+
+First, version-pinned entries already cover the same case more cleanly. With `npm approve-scripts` defaulting to `--pin=true`, a version bump produces a resolved identity that no longer matches the existing entry. The install fails through the normal `allowScripts` path and the user re-approves explicitly. No separate detection layer is needed.
+
+Second, the lockfile-based check fires only on the `false → true` transition. It does not catch the more dangerous case of a package that already had scripts shipping a malicious update — exactly the case that the September 2025 attacks (chalk, debug, Shai-Hulud follow-ons) actually exploited. Adding a layer that catches the narrow case but not the dangerous one risks creating a false sense of security.
+
+The simpler design (exact identity match against `allowScripts` with version-pinning by default) provides equivalent protection in the case the lockfile check was meant to cover, and the broader expressiveness of `--pin=false` remains available for teams that prefer name-only entries with the trade-off documented.
+
 ## Implementation
 
 ### npm CLI changes
 
 The primary enforcement point is in the `@npmcli/run-script` and `@npmcli/arborist` packages:
 
-1. `@npmcli/arborist`: During the `reify` step, before running lifecycle scripts for each dependency, check the resolved package name and version against the root project's `allowScripts` field. If the package is not allowed, skip its scripts and record it in a "blocked scripts" list. The TOFU check also lives here: in `rebuild.js`'s `#runScripts()`, compare each node's `hasInstallScript` against the old lockfile's value (available via `actualTree.meta.get(path)` since scripts run before `_saveIdealTree()` writes the new lockfile). If the old value is `false` and the fetched package has scripts, block the script even if a name-only `allowScripts` entry exists.
+1. `@npmcli/arborist`: During the `reify` step, before running lifecycle scripts for each dependency, check the resolved package name and version against the root project's `allowScripts` field. If the package is not allowed, skip its scripts and record it in a "blocked scripts" list.
 
 2. `@npmcli/run-script`: Add an `allowed` check that consults the policy stack (CLI flags -> `package.json` -> `.npmrc`). When a script is blocked, emit a warning (or error in strict mode) with the package name, script name, and remediation command.
 
-3. `npm approve-scripts` (new command): Reads the current `node_modules` tree (from `package-lock.json` or disk), identifies packages with install scripts not yet in `allowScripts`, and writes decisions to `package.json`. Triggers `npm rebuild` for newly approved packages. This command has two modes:
+3. `npm approve-scripts` (new command): Reads the current `node_modules` tree (from `package-lock.json` or disk), identifies packages with install scripts not yet in `allowScripts`, and either writes decisions to `package.json` or lists them. The command has two modes:
 
-    - Non-interactive (works today): positional arguments (`npm approve-scripts canvas sharp`) and `--all` use only the existing `read` package and `proc-log` input primitives, which are already in the CLI.
-    - Interactive multi-select (new dependency required): the arrow-key/checkbox UI shown in the design section would require adding a terminal prompt library such as `enquirer` or `@inquirer/prompts`. The npm CLI does not currently bundle anything capable of multi-select prompts; its `read` package only handles single-line text input. pnpm solved this by depending on `enquirer`. The interactive mode could ship in a follow-up if adding a new dependency is contentious.
-
-4. `npm ignored-scripts` (new command): Reads the "blocked scripts" metadata (stored in `node_modules/.package-lock.json` or a similar location) and prints a summary.
+    - Write (positional arguments and `--all`): uses only the existing `read` package and `proc-log` input primitives, which are already in the CLI. No new dependencies required.
+    - Read-only preview (`--pending`): walks the resolved tree from `package-lock.json` or disk and prints packages whose install scripts are not yet covered by `allowScripts`. No state is persisted. It's a query of the present tree, not a record of past blocks. Implementation reuses the same tree-walk and allowlist-match logic as the write mode.
 
 ### Configuration
 
@@ -359,14 +369,14 @@ New `.npmrc` settings:
 
 ### Related npm RFCs
 
-- [RFC #861](https://github.com/npm/rfcs/pull/861): "Add option to require install script approval." Adds opt-in controls without changing defaults. This RFC supersedes #861 with a broader scope (default-deny).
+- [RFC #861](https://github.com/npm/rfcs/pull/861): "Add option to require install script approval." Originally proposed an opt-in JSON allowlist; rewritten in April 2026 to use [npm query](https://docs.npmjs.com/cli/v11/using-npm/dependency-selectors) selectors, which exposed the trustworthy-identity gap addressed in [Identity matching](#identity-matching) above. The author plans to close #861 in favor of this RFC; the identity rule here borrows directly from their analysis ("the query language has no trustworthy package identity"). This RFC supersedes #861 with default-deny semantics and a map syntax that is forward-compatible with a future selector grammar.
 - [RFC #92](https://github.com/npm/rfcs/pull/92): "Add staging workflow for CI and human interoperability." A publish-side security proposal (closed without implementation).
 
 ## Migration Plan
 
 ### Phase 1: Tooling and advisory warnings (next minor release)
 
-- Ship `npm approve-scripts` and `npm ignored-scripts` commands.
+- Ship `npm approve-scripts` (with `--pending` mode for previewing).
 - Recognize the `allowScripts` field in `package.json`.
 - Print advisory warnings when dependency install scripts run that are not covered by an `allowScripts` field.
 - No change in default behavior: scripts still run.
@@ -386,14 +396,18 @@ New `.npmrc` settings:
 
 ## Unresolved Questions and Bikeshedding
 
-1. Field name: this RFC proposes `allowScripts`. Alternatives include `allowBuilds` (matching pnpm's naming) or `trustedDependencies` (matching Bun). `allowScripts` is the most self-descriptive for npm's context, where the feature controls lifecycle *scripts* rather than *builds* in the broader sense.
+1. ~~Field name~~: Resolved. This RFC keeps `allowScripts`. Alternatives considered include `allowBuilds` (matching pnpm's naming), `trustedDependencies` (matching Bun), and `installScriptPolicy` / `installScriptAllowlist` (suggested in [RFC #861](https://github.com/npm/rfcs/pull/861)). `allowScripts` is the most self-descriptive for npm's context, where the feature controls lifecycle *scripts* rather than *builds* in the broader sense. The surface similarity to the existing `--ignore-scripts` flag is acceptable: `--ignore-scripts` is a boolean CLI flag (a global switch), while `allowScripts` is a per-package map in `package.json` (a granular allowlist). They're different things at different config layers. `--ignore-scripts` continues to take precedence when set, as documented in [Enforcement behavior](#enforcement-behavior).
 
 2. Script content preview: should `npm approve-scripts` display the actual script contents (e.g., `"postinstall": "node-gyp rebuild"`) to help users make informed decisions? pnpm shows package names only; Bun shows script names. Showing full script content adds security value but may be noisy for long scripts.
 
 3. Provenance integration: should packages published with [npm provenance](https://docs.npmjs.com/generating-provenance-statements) attestations receive any preferential treatment in the script policy? For example, a future `trust-policy` setting could allow scripts only from packages with verified provenance. This is deferred to a follow-up RFC.
 
-4. ~~Version pinning default~~: Resolved. `npm approve-scripts` should default to version-pinned entries for security (see "Detecting unexpected script changes" section). A `--pin=false` flag allows name-only entries for convenience.
+4. ~~Version pinning default~~: Resolved. `npm approve-scripts` defaults to version-pinned entries for security: a version bump produces a resolved identity that does not match the existing entry, requiring re-approval through the normal `allowScripts` mechanism. A `--pin=false` flag allows name-only entries for convenience, accepting the trade-off that future versions of an allowed package run their scripts without further prompting.
 
 5. Remaining native addon packages: the ecosystem has largely shifted to prebuilt binaries, but some packages still require `node-gyp` at install time. Updated data on how many of the top-downloaded packages still use install scripts would strengthen the migration plan. If the number is small enough, the default-deny change is justified without a new npm-side mechanism for native addon distribution.
 
 6. `.npmrc` expressiveness: the `.npmrc` format (comma-separated list of package names) cannot express the full tri-state + version-pinning model available in `package.json`. This is acceptable for the global/npx use case (where fine-grained control matters less), but the limitation should be documented.
+
+7. Queryable trustworthy-identity field for arborist: the matching rule above works today by parsing keys with `npm-package-arg` and comparing against the lockfile's `resolved` field. A follow-up RFC could expose the same identity through [npm query](https://docs.npmjs.com/cli/v11/using-npm/dependency-selectors) — for example, a `:resolved(<spec>)` pseudo-selector or a `[resolved=...]` attribute selector that reads from the lockfile's resolution rather than the tarball's self-report. Once that exists, the `allowScripts` key position could accept full selector syntax (`":type(git)"`, `":root > .prod"`, etc.) as sugar over the bare-name keys defined above. The implementation would build on the resolver data already persisted in `package-lock.json` plus existing tooling (`versionFromTgz`, `hosted-git-info`).
+
+8. Interactive multi-select for `npm approve-scripts`: this RFC ships only command-line forms (positional arguments, `--all`, `--pending`) so that no new bundled dependency is needed. An interactive prompt-driven mode would require a multi-select prompt library, which the npm CLI does not currently ship. This is deferred to a follow-up RFC if a suitable already-bundled primitive emerges, or if the maintenance cost of an added dependency becomes acceptable. The non-interactive forms in this RFC are sufficient for scripted use, CI, and ad-hoc command-line approval.
