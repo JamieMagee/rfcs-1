@@ -176,6 +176,8 @@ Examples:
 
 A name-only entry permits any resolved version or commit: `"npm/cli": true` matches any commit of that repository just as `"npm": true` matches any version of the package. A fully-qualified entry (`"npm/cli#c12ea07"`, `"sharp@0.34.0"`) pins exactly one.
 
+Three implementation notes follow from the table. For registry-resolved deps, the matcher uses `name@version` rather than the full `resolved` URL. This handles the `omitLockfileRegistryResolved` config (a user setting that omits `resolved` for registry packages from the lockfile). For git deps, the key's committish (the part after `#`) is matched as a prefix of the resolved full SHA: `"npm/cli#c12ea07": true` matches a node resolved to `git+ssh://git@github.com/npm/cli.git#c12ea07a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e`. Users typically write short SHAs; the resolver always pins to the 40-character commit hash. For file, tarball, and remote URL deps, the `resolved` value is matched as an exact string.
+
 #### Fields the key MUST NOT match against
 
 Implementations MUST NOT match keys against:
@@ -278,6 +280,7 @@ The script policy is enforced by the following commands:
 In a workspace (monorepo) context:
 
 - The root `package.json` `allowScripts` field is the single source of truth for the entire workspace.
+- `allowScripts` is read from the workspace root's `package.json` (the project containing the `workspaces` array) regardless of where the user runs `npm install`. Running it from inside a sub-workspace like `packages/foo/` does not bypass the root policy.
 - Individual workspace `package.json` files do not have their own `allowScripts` fields. All script permissions are managed at the root.
 - If `allowScripts` appears in a non-root workspace `package.json`, npm prints a warning and ignores the field. Silently dropping it would be confusing for developers who placed it there expecting it to do something.
 - This avoids ambiguity about merge semantics and ensures security policy is set in one place.
@@ -285,6 +288,10 @@ In a workspace (monorepo) context:
 ### Optional dependencies
 
 If a package in `optionalDependencies` has install scripts that are blocked, it is treated as a failed optional dependency installation. This is consistent with existing behavior where optional dependencies that fail to build are silently skipped.
+
+### Bundled dependencies
+
+Bundled dependencies are packages shipped inside a parent package's tarball. The lockfile marks them with `inBundle: true`, but they have no independent `resolved` URL since they were never fetched on their own. Bundled deps with install scripts are treated as unreviewed and blocked with a warning. Users who want to allow them can add the bundled package's `name@version` to `allowScripts`.
 
 ## Rationale and Alternatives
 
@@ -341,7 +348,7 @@ The primary enforcement point is in the `@npmcli/run-script` and `@npmcli/arbori
 3. `npm approve-scripts` (new command): Reads the current `node_modules` tree (from `package-lock.json` or disk), identifies packages with install scripts not yet in `allowScripts`, and either writes decisions to `package.json` or lists them. The command has two modes:
 
     - Write (positional arguments and `--all`): uses only the existing `read` package and `proc-log` input primitives, which are already in the CLI. No new dependencies required.
-    - Read-only preview (`--pending`): walks the resolved tree from `package-lock.json` or disk and prints packages whose install scripts are not yet covered by `allowScripts`. No state is persisted. It's a query of the present tree, not a record of past blocks. Implementation reuses the same tree-walk and allowlist-match logic as the write mode.
+    - Read-only preview (`--pending`): walks the resolved tree from `package-lock.json` or disk and prints packages whose install scripts are not yet covered by `allowScripts`. The walker must call `isNodeGypPackage(node.path)` at runtime in addition to checking `hasInstallScript` from the lockfile. Packages with a `binding.gyp` file but no explicit `install`/`preinstall`/`postinstall` script have `hasInstallScript: false` in the lockfile, but arborist injects a synthetic `node-gyp rebuild` install script for them at install time. A lockfile-only walker would miss these. No state is persisted. It's a query of the present tree, not a record of past blocks. Implementation reuses the same tree-walk and allowlist-match logic as the write mode.
 
 ### Configuration
 
