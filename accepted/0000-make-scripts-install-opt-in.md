@@ -129,6 +129,8 @@ Package entries may include version constraints using the `@` separator:
 
 A name-only entry (e.g., `"sharp": true`) allows all versions. A versioned entry (e.g., `"nx@21.6.4 || 21.6.5": true`) restricts the allowance to specific versions, using exact versions joined by `||`. Semver ranges like `^`, `~`, `>=`, or `<` are not supported. This is intentional: a range like `nx@<21.6.4` would automatically trust future versions that haven't been reviewed, which defeats the purpose of an allowlist. If both a name-only entry and a versioned entry exist for the same package, the versioned entry takes precedence for matching versions.
 
+If overlapping versioned entries assign different values to the same resolved version (for example, `"pkg@1 || 2": true` and `"pkg@2 || 3": false` both match version `2`), the `false` value wins. Deny-wins is the safer default; users who want a specific version allowed despite an overlapping deny should narrow the deny entry.
+
 This matches pnpm's `allowBuilds` design, which also restricts versioned entries to exact versions with `||` disjunction.
 
 Non-registry dependencies (git, file, tarball) use [`package-spec`](https://docs.npmjs.com/cli/v11/using-npm/package-spec) syntax. See [Identity matching](#identity-matching) below for the supported key forms.
@@ -216,32 +218,34 @@ allow-scripts = canvas, sharp, sqlite3
 
 ### The `npm approve-scripts` command
 
-A new command writes allowlist decisions to the `allowScripts` field in `package.json`:
+A new command writes approval decisions to the `allowScripts` field in `package.json`:
 
 ```sh
 # Approve specific packages
 npm approve-scripts canvas sharp
 
-# Deny specific packages
-npm approve-scripts !core-js
-
 # Approve all packages with pending scripts
 npm approve-scripts --all
 ```
 
-Approved packages are written with `true`, denied packages with `false`, and newly approved packages are immediately rebuilt.
+Approved packages are written with `true`, and newly approved packages are immediately rebuilt. Denial is a separate command, [`npm deny-scripts`](#the-npm-deny-scripts-command), described below.
 
-When an entry for a package already exists in `allowScripts` and the installed version differs, the command rewrites the entry rather than appending a `||` clause:
+`--pin` controls only how approvals are written. Denials are always recorded name-only (`"pkg": false`), since pinning a denial to a specific version would silently allow a future version to run scripts again. This is intentional: pinning is conservative for approve and permissive for deny, so the asymmetry favours the safer default in both directions.
 
-| Existing entry      | Installed version | `--pin=true` (default)             | `--pin=false`         |
-|---------------------|-------------------|------------------------------------|-----------------------|
-| `pkg@a.b.c: true`   | `pkg@x.y.z`       | rewrite to `pkg@x.y.z: true`       | rewrite to `pkg: true`|
-| `pkg: true`         | `pkg@x.y.z`       | upgrade to `pkg@x.y.z: true`       | leave as `pkg: true`  |
-| (no entry)          | `pkg@x.y.z`       | write `pkg@x.y.z: true`            | write `pkg: true`     |
+When an entry for a package already exists in `allowScripts` and the installed version differs, the command adds a new entry for the installed version rather than rewriting the existing one. The map stays focused on what is currently installed, and hand-written multi-version statements are preserved:
 
-The map stays focused on what is currently installed. Users who explicitly want a multi-version allowance (`pkg@a.b.c || x.y.z: true`) can edit the entry by hand.
+| Existing entry              | Installed version           | `--pin=true` (default)         | `--pin=false`        |
+|-----------------------------|-----------------------------|--------------------------------|----------------------|
+| `pkg: true`                 | (none, package removed)     | no edit                        | no edit              |
+| `pkg@a.b.c: true`           | (none, package removed)     | no edit                        | no edit              |
+| `pkg@a.b.c \|\| d.e.f: true`  | `pkg@x.y.z`                 | add `pkg@x.y.z: true`          | add `pkg: true`      |
+| `pkg@a.b.c \|\| x.y.z: true`  | `pkg@x.y.z` (already covered) | no edit                        | no edit              |
+| (no entry)                  | `pkg@a.b.c` and `pkg@x.y.z` | write both pinned              | write `pkg: true`    |
+| `pkg: false`                | any                         | no edit (existing deny wins)   | no edit              |
 
-List packages with install scripts that are not yet in `allowScripts`, without writing any changes:
+`approve-scripts` does not normalize or prune existing entries. It only adds entries for the currently installed versions of pending packages. The deny-wins conflict rule from the [allowScripts field](#the-allowscripts-field) section applies here too: an existing `false` entry is never overwritten by `--all`. Users who want to flip a deny to an approve must edit the entry by hand.
+
+List packages with install scripts that are not yet covered by the resolved policy, without writing any changes:
 
 ```
 $ npm approve-scripts --pending
@@ -252,6 +256,21 @@ The following packages have install scripts that are not approved:
 
 To approve them, run: npm approve-scripts
 ```
+
+`--pending` consults the same precedence stack as install-time enforcement (CLI flag → root `package.json` → project `.npmrc` → user `.npmrc` → global `.npmrc`), so the listed packages match what would be blocked during a real install.
+
+### The `npm deny-scripts` command
+
+The companion command to `npm approve-scripts`. Writes `"pkg": false` entries into `allowScripts`:
+
+```sh
+# Deny specific packages
+npm deny-scripts core-js telemetry-pkg
+```
+
+Denied entries are always recorded name-only, regardless of `--pin`. See the [approve-scripts section](#the-npm-approve-scripts-command) for the reasoning.
+
+The two commands share implementation. Splitting them avoids the `!`-prefix syntax used by pnpm (`pnpm approve-builds !core-js`), which conflicts with shell history expansion in zsh and bash and forces users to single-quote arguments. A pair of clearly-named commands also reads better in scripts and CI configuration.
 
 ### Enforcement behavior
 
@@ -345,10 +364,11 @@ The primary enforcement point is in the `@npmcli/run-script` and `@npmcli/arbori
 
 2. `@npmcli/run-script`: Add an `allowed` check that consults the policy stack (CLI flags -> `package.json` -> `.npmrc`). When a script is blocked, emit a warning (or error in strict mode) with the package name, script name, and remediation command.
 
-3. `npm approve-scripts` (new command): Reads the current `node_modules` tree (from `package-lock.json` or disk), identifies packages with install scripts not yet in `allowScripts`, and either writes decisions to `package.json` or lists them. The command has two modes:
+3. `npm approve-scripts` and `npm deny-scripts` (new commands): both share implementation. They read the current `node_modules` tree (from `package-lock.json` or disk), identify packages with install scripts not yet in `allowScripts`, and route to a common writer that respects the asymmetric pin rule (approved entries honour `--pin`; denied entries are always name-only). `approve-scripts` has three operating modes:
 
     - Write (positional arguments and `--all`): uses only the existing `read` package and `proc-log` input primitives, which are already in the CLI. No new dependencies required.
-    - Read-only preview (`--pending`): walks the resolved tree from `package-lock.json` or disk and prints packages whose install scripts are not yet covered by `allowScripts`. The walker must call `isNodeGypPackage(node.path)` at runtime in addition to checking `hasInstallScript` from the lockfile. Packages with a `binding.gyp` file but no explicit `install`/`preinstall`/`postinstall` script have `hasInstallScript: false` in the lockfile, but arborist injects a synthetic `node-gyp rebuild` install script for them at install time. A lockfile-only walker would miss these. No state is persisted. It's a query of the present tree, not a record of past blocks. Implementation reuses the same tree-walk and allowlist-match logic as the write mode.
+    - Read-only preview (`--pending`): consults the resolved policy stack (CLI flag → root `package.json` → project `.npmrc` → user `.npmrc` → global `.npmrc`) and walks the resolved tree from `package-lock.json` or disk. Prints packages whose install scripts are not yet covered. The walker must call `isNodeGypPackage(node.path)` at runtime in addition to checking `hasInstallScript` from the lockfile. Packages with a `binding.gyp` file but no explicit `install`/`preinstall`/`postinstall` script have `hasInstallScript: false` in the lockfile, but arborist injects a synthetic `node-gyp rebuild` install script for them at install time. A lockfile-only walker would miss these. No state is persisted. It's a query of the present tree, not a record of past blocks.
+    - `deny-scripts` (separate command): same writer path, restricted to producing `false` entries. Always name-only regardless of `--pin`.
 
 ### Configuration
 
@@ -383,7 +403,7 @@ New `.npmrc` settings:
 
 ### Phase 1: Tooling and advisory warnings (next minor release)
 
-- Ship `npm approve-scripts` (with `--pending` mode for previewing).
+- Ship `npm approve-scripts` and `npm deny-scripts` (with `--pending` mode for previewing on `approve-scripts`).
 - Recognize the `allowScripts` field in `package.json`.
 - Print advisory warnings when dependency install scripts run that are not covered by an `allowScripts` field.
 - No change in default behavior: scripts still run.
