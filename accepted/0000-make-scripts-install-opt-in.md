@@ -129,9 +129,9 @@ Package entries may include version constraints using the `@` separator:
 
 A name-only entry (e.g., `"sharp": true`) allows all versions. A versioned entry (e.g., `"nx@21.6.4 || 21.6.5": true`) restricts the allowance to specific versions, using exact versions joined by `||`. Semver ranges like `^`, `~`, `>=`, or `<` are not supported. This is intentional: a range like `nx@<21.6.4` would automatically trust future versions that haven't been reviewed, which defeats the purpose of an allowlist. If both a name-only entry and a versioned entry exist for the same package, the versioned entry takes precedence for matching versions.
 
-If overlapping versioned entries assign different values to the same resolved version (for example, `"pkg@1 || 2": true` and `"pkg@2 || 3": false` both match version `2`), the `false` value wins. Deny-wins is the safer default; users who want a specific version allowed despite an overlapping deny should narrow the deny entry.
-
 This matches pnpm's `allowBuilds` design, which also restricts versioned entries to exact versions with `||` disjunction.
+
+If overlapping versioned entries assign different values to the same resolved version (for example, `"pkg@1 || 2": true` and `"pkg@2 || 3": false` both match version `2`), the `false` value wins. Deny-wins is the safer default; users who want a specific version allowed despite an overlapping deny should narrow the deny entry.
 
 Non-registry dependencies (git, file, tarball) use [`package-spec`](https://docs.npmjs.com/cli/v11/using-npm/package-spec) syntax. See [Identity matching](#identity-matching) below for the supported key forms.
 
@@ -232,18 +232,23 @@ Approved packages are written with `true`, and newly approved packages are immed
 
 `--pin` controls only how approvals are written. Denials are always recorded name-only (`"pkg": false`), since pinning a denial to a specific version would silently allow a future version to run scripts again. This is intentional: pinning is conservative for approve and permissive for deny, so the asymmetry favours the safer default in both directions.
 
-When an entry for a package already exists in `allowScripts` and the installed version differs, the command adds a new entry for the installed version rather than rewriting the existing one. The map stays focused on what is currently installed, and hand-written multi-version statements are preserved:
+When an entry for a package already exists in `allowScripts` and the installed version differs, the command's behaviour depends on the shape of the existing entry. Single-version pins are auto-rewritten to track the installed version; multi-version statements (`pkg@a.b.c || x.y.z`) are never modified, since they likely capture user intent the command can't infer; entries for removed packages are left alone; and existing `false` entries always win:
 
-| Existing entry              | Installed version           | `--pin=true` (default)         | `--pin=false`        |
-|-----------------------------|-----------------------------|--------------------------------|----------------------|
-| `pkg: true`                 | (none, package removed)     | no edit                        | no edit              |
-| `pkg@a.b.c: true`           | (none, package removed)     | no edit                        | no edit              |
-| `pkg@a.b.c \|\| d.e.f: true`  | `pkg@x.y.z`                 | add `pkg@x.y.z: true`          | add `pkg: true`      |
-| `pkg@a.b.c \|\| x.y.z: true`  | `pkg@x.y.z` (already covered) | no edit                        | no edit              |
-| (no entry)                  | `pkg@a.b.c` and `pkg@x.y.z` | write both pinned              | write `pkg: true`    |
-| `pkg: false`                | any                         | no edit (existing deny wins)   | no edit              |
+| Existing entry                | Installed version             | `--pin=true` (default)                              | `--pin=false`                                       |
+|-------------------------------|-------------------------------|-----------------------------------------------------|-----------------------------------------------------|
+| `pkg: true`                   | (none, package removed)       | no edit                                             | no edit                                             |
+| `pkg@a.b.c: true`             | (none, package removed)       | no edit                                             | no edit                                             |
+| `pkg@a.b.c: true`             | `pkg@x.y.z`                   | rewrite to `pkg@x.y.z: true`                        | rewrite to `pkg: true`                              |
+| `pkg: true`                   | `pkg@x.y.z`                   | upgrade to `pkg@x.y.z: true`                        | leave as `pkg: true`                                |
+| `pkg@a.b.c \|\| d.e.f: true`    | `pkg@x.y.z`                   | add `pkg@x.y.z: true`                               | add `pkg: true`                                     |
+| `pkg@a.b.c \|\| x.y.z: true`    | `pkg@x.y.z` (already covered) | no edit                                             | no edit                                             |
+| (no entry)                    | `pkg@a.b.c` and `pkg@x.y.z`   | write both pinned                                   | write `pkg: true`                                   |
+| `pkg: false`                  | any                           | no edit (existing deny wins)                        | no edit (existing deny wins)                        |
+| `pkg@a.b.c: false`            | `pkg@x.y.z`                   | no edit; `pkg@x.y.z` remains unreviewed, with a warning | no edit; `pkg@x.y.z` remains unreviewed, with a warning |
 
-`approve-scripts` does not normalize or prune existing entries. It only adds entries for the currently installed versions of pending packages. The deny-wins conflict rule from the [allowScripts field](#the-allowscripts-field) section applies here too: an existing `false` entry is never overwritten by `--all`. Users who want to flip a deny to an approve must edit the entry by hand.
+Pinned deny entries (`pkg@a.b.c: false`) are not auto-rewritten when the package version changes, since that would either silently re-allow or silently re-deny the new version. The currently-installed version is left unreviewed and the command prints a warning suggesting the user run `npm deny-scripts pkg` (to re-deny name-only) or remove the pinned deny entirely.
+
+The deny-wins conflict rule from the [allowScripts field](#the-allowscripts-field) section applies here too: an existing `false` entry is never overwritten by `--all`. Users who want to flip a deny to an approve must edit the entry by hand.
 
 List packages with install scripts that are not yet covered by the resolved policy, without writing any changes:
 
